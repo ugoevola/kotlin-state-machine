@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "io.github.ugoevola"
-version = "1.0.0"
+version = "1.1.0"
 
 repositories {
     mavenLocal()

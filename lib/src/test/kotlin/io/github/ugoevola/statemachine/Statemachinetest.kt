@@ -7,18 +7,34 @@ import io.github.ugoevola.statemachine.contract.MachineTransactionPort
 import io.github.ugoevola.statemachine.core.StateMachine
 import io.github.ugoevola.statemachine.core.StateMachineDefinition
 import io.github.ugoevola.statemachine.dsl.stateMachine
+import io.github.ugoevola.statemachine.dsl.transitionGroup
 import kotlin.test.*
+
+// ─── Chained-transient fixtures (top-level required by Kotlin) ───────────────
+
+enum class ChainState { A, B, C, D }
+
+sealed interface ChainEvent<out R> : MachineEvent<R> {
+    data object Go : ChainEvent<String>
+}
+
+data class ChainTransaction(override var currentState: ChainState) : MachineTransaction<ChainState>
+data class ChainContext(override val transaction: ChainTransaction?) : MachineContext<ChainTransaction>
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
 
-enum class OrderState { PENDING, CONFIRMED, SHIPPED, DELIVERED, CANCELLED }
+enum class OrderState {
+    PENDING, CONFIRMED, SHIPPED, DELIVERING, DELIVERED, CANCELLED
+    //                           ^^^^^^^^^^
+    // DELIVERING is a transient state: fires its onEnter action then automatically
+    // advances to DELIVERED.
+}
 
 sealed interface OrderEvent<out R> : MachineEvent<R> {
     data object Confirm  : OrderEvent<String>
     data object Ship     : OrderEvent<String>
     data object Deliver  : OrderEvent<String>
     data object Cancel   : OrderEvent<String>
-    // Event with no action result
     data object Reset    : OrderEvent<Unit>
 }
 
@@ -32,62 +48,84 @@ data class OrderContext(
     val isPriority: Boolean = false
 ) : MachineContext<OrderTransaction>
 
+// ─── Shared transition groups ─────────────────────────────────────────────────
+
+/** Groups are defined once and reused across multiple machine definitions in tests. */
+private val confirmGroup =
+    transitionGroup<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+        transition(
+            from   = OrderState.PENDING,
+            on     = OrderEvent.Confirm::class,
+            to     = OrderState.CONFIRMED,
+            action = { ctx ->
+                ctx.transaction!!.log.add("confirm-action")
+                "order-confirmed"
+            }
+        )
+        onEnter(OrderState.CONFIRMED) { ctx ->
+            ctx.transaction!!.log.add("entered-confirmed")
+        }
+    }
+
+private val cancelGroup =
+    transitionGroup<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+        transition(
+            from   = OrderState.PENDING,
+            on     = OrderEvent.Cancel::class,
+            to     = OrderState.CANCELLED,
+            action = { "order-cancelled-from-pending" }
+        )
+        transition(
+            from   = OrderState.CONFIRMED,
+            on     = OrderEvent.Cancel::class,
+            to     = OrderState.CANCELLED,
+            action = { "order-cancelled-from-confirmed" }
+        )
+        onEnter(OrderState.CANCELLED) { ctx ->
+            ctx.transaction!!.log.add("entered-cancelled")
+        }
+    }
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-private fun buildDefinition(
-    isPriority: Boolean = false
-) = stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+/**
+ * Builds a complete definition using [include] for the shared groups
+ * and [transientState] for DELIVERING → DELIVERED.
+ */
+private fun buildDefinition() =
+    stateMachine {
 
-    transition(
-        from  = OrderState.PENDING,
-        on    = OrderEvent.Confirm::class,
-        to    = OrderState.CONFIRMED,
-        action = { ctx ->
-            ctx.transaction!!.log.add("confirm-action")
-            "order-confirmed"
-        }
-    )
+        include(confirmGroup)
+        include(cancelGroup)
 
-    transition(
-        from  = OrderState.CONFIRMED,
-        on    = OrderEvent.Ship::class,
-        guard = { ctx -> ctx.isPriority },          // only if priority
-        to    = OrderState.SHIPPED,
-        action = { ctx ->
-            ctx.transaction!!.log.add("ship-action")
-            "order-shipped"
-        }
-    )
+        transition(
+            from  = OrderState.CONFIRMED,
+            on    = OrderEvent.Ship::class,
+            guard = { ctx -> ctx.isPriority },
+            to    = OrderState.SHIPPED,
+            action = { ctx ->
+                ctx.transaction!!.log.add("ship-action")
+                "order-shipped"
+            }
+        )
 
-    transition(
-        from  = OrderState.SHIPPED,
-        on    = OrderEvent.Deliver::class,
-        to    = OrderState.DELIVERED
-        // no action → result will be null
-    )
+        // DELIVERING is transient: onEnter runs, then the machine automatically
+        // advances to DELIVERED without requiring a new event.
+        transientState(
+            state  = OrderState.DELIVERING,
+            then   = OrderState.DELIVERED,
+            action = { ctx ->
+                ctx.transaction!!.log.add("delivering-action")
+                "order-delivering"
+            }
+        )
 
-    transition(
-        from  = OrderState.PENDING,
-        on    = OrderEvent.Cancel::class,
-        to    = OrderState.CANCELLED,
-        action = { "order-cancelled-from-pending" }
-    )
-
-    transition(
-        from  = OrderState.CONFIRMED,
-        on    = OrderEvent.Cancel::class,
-        to    = OrderState.CANCELLED,
-        action = { "order-cancelled-from-confirmed" }
-    )
-
-    onEnter(OrderState.CONFIRMED) { ctx ->
-        ctx.transaction!!.log.add("entered-confirmed")
+        transition(
+            from = OrderState.SHIPPED,
+            on   = OrderEvent.Deliver::class,
+            to   = OrderState.DELIVERING
+        )
     }
-
-    onEnter(OrderState.CANCELLED) { ctx ->
-        ctx.transaction!!.log.add("entered-cancelled")
-    }
-}
 
 private fun buildMachine(
     definition: StateMachineDefinition<OrderState, OrderEvent<*>, OrderContext, OrderTransaction>,
@@ -158,15 +196,20 @@ class StateMachineTest {
     }
 
     @Test
-    fun `transition with no action returns null`() {
-        val tx  = OrderTransaction(OrderState.SHIPPED)
+    fun `currentState is updated before onEnter is called`() {
+        var stateInsideOnEnter: OrderState? = null
+        val definition =
+            stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+                transition(from = OrderState.PENDING, on = OrderEvent.Confirm::class, to = OrderState.CONFIRMED)
+                onEnter(OrderState.CONFIRMED) { ctx ->
+                    stateInsideOnEnter = ctx.transaction!!.currentState
+                }
+            }
+        val tx  = OrderTransaction(OrderState.PENDING)
         val ctx = OrderContext(tx)
-        val machine = buildMachine(buildDefinition())
+        buildMachine(definition).applyEvent(OrderEvent.Confirm, ctx)
 
-        val result = machine.applyEvent(OrderEvent.Deliver, ctx)
-
-        assertNull(result)
-        assertEquals(OrderState.DELIVERED, tx.currentState)
+        assertEquals(OrderState.CONFIRMED, stateInsideOnEnter)
     }
 
     // ── Guards ────────────────────────────────────────────────────────────────
@@ -186,7 +229,7 @@ class StateMachineTest {
     @Test
     fun `guard blocks transition and throws when condition is false`() {
         val tx  = OrderTransaction(OrderState.CONFIRMED)
-        val ctx = OrderContext(tx, isPriority = false)   // guard will fail
+        val ctx = OrderContext(tx, isPriority = false)
         val machine = buildMachine(buildDefinition())
 
         assertFailsWith<IllegalStateException> {
@@ -224,7 +267,7 @@ class StateMachineTest {
 
     @Test
     fun `throws when no rule matches the current state`() {
-        val tx  = OrderTransaction(OrderState.DELIVERED)   // terminal state
+        val tx  = OrderTransaction(OrderState.DELIVERED)
         val ctx = OrderContext(tx)
         val machine = buildMachine(buildDefinition())
 
@@ -237,7 +280,7 @@ class StateMachineTest {
 
     @Test
     fun `throws when event is fired from wrong state`() {
-        val tx  = OrderTransaction(OrderState.PENDING)   // not yet confirmed
+        val tx  = OrderTransaction(OrderState.PENDING)
         val ctx = OrderContext(tx)
         val machine = buildMachine(buildDefinition())
 
@@ -303,5 +346,141 @@ class StateMachineTest {
         machine.applyEvent(OrderEvent.Deliver,  ctx)
 
         assertEquals(OrderState.DELIVERED, tx.currentState)
+    }
+
+    // ── transitionGroup / include ─────────────────────────────────────────────
+
+    @Test
+    fun `include imports transitions from a group`() {
+        val tx  = OrderTransaction(OrderState.PENDING)
+        val ctx = OrderContext(tx)
+        // Machine built with only the confirmGroup included
+        val definition = stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+            include(confirmGroup)
+        }
+        val machine = buildMachine(definition)
+
+        machine.applyEvent(OrderEvent.Confirm, ctx)
+
+        assertEquals(OrderState.CONFIRMED, tx.currentState)
+    }
+
+    @Test
+    fun `include imports onEnter actions from a group`() {
+        val tx  = OrderTransaction(OrderState.PENDING)
+        val ctx = OrderContext(tx)
+        val definition = stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+            include(confirmGroup)
+        }
+        buildMachine(definition).applyEvent(OrderEvent.Confirm, ctx)
+
+        assertContains(tx.log, "entered-confirmed")
+    }
+
+    @Test
+    fun `multiple groups can be included in the same machine`() {
+        val tx  = OrderTransaction(OrderState.CONFIRMED)
+        val ctx = OrderContext(tx)
+        val definition = stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+            include(confirmGroup)
+            include(cancelGroup)
+        }
+        val machine = buildMachine(definition)
+
+        val result = machine.applyEvent(OrderEvent.Cancel, ctx)
+
+        assertEquals("order-cancelled-from-confirmed", result)
+        assertEquals(OrderState.CANCELLED, tx.currentState)
+    }
+
+    @Test
+    fun `group can be reused across different machine definitions`() {
+        val definitionA = stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+            include(cancelGroup)
+        }
+        val definitionB = stateMachine<OrderState, OrderEvent<*>, OrderContext, OrderTransaction> {
+            include(cancelGroup)
+        }
+
+        val txA = OrderTransaction(OrderState.PENDING)
+        val txB = OrderTransaction(OrderState.PENDING)
+
+        buildMachine(definitionA).applyEvent(OrderEvent.Cancel, OrderContext(txA))
+        buildMachine(definitionB).applyEvent(OrderEvent.Cancel, OrderContext(txB))
+
+        assertEquals(OrderState.CANCELLED, txA.currentState)
+        assertEquals(OrderState.CANCELLED, txB.currentState)
+    }
+
+    // ── transientState ────────────────────────────────────────────────────────
+
+    @Test
+    fun `transient state executes its action then advances automatically`() {
+        val tx  = OrderTransaction(OrderState.SHIPPED)
+        val ctx = OrderContext(tx, isPriority = true)
+        val machine = buildMachine(buildDefinition())
+
+        machine.applyEvent(OrderEvent.Deliver, ctx)
+
+        // The machine passed through DELIVERING and landed on DELIVERED automatically
+        assertEquals(OrderState.DELIVERED, tx.currentState)
+        assertContains(tx.log, "delivering-action")
+    }
+
+    @Test
+    fun `transient state is never the final resting state`() {
+        val tx  = OrderTransaction(OrderState.SHIPPED)
+        val ctx = OrderContext(tx, isPriority = true)
+        val machine = buildMachine(buildDefinition())
+
+        machine.applyEvent(OrderEvent.Deliver, ctx)
+
+        assertNotEquals(OrderState.DELIVERING, tx.currentState)
+    }
+
+    @Test
+    fun `transient state result is forwarded to applyEvent caller`() {
+        val tx  = OrderTransaction(OrderState.SHIPPED)
+        val ctx = OrderContext(tx, isPriority = true)
+        val machine = buildMachine(buildDefinition())
+
+        val result = machine.applyEvent(OrderEvent.Deliver, ctx)
+
+        // The action on DELIVERING returns "order-delivering"
+        assertEquals("order-delivering", result)
+    }
+
+    @Test
+    fun `chained transient states are traversed in a single event`() {
+        // ChainState.A → B (transient) → C (transient) → D
+        val log = mutableListOf<String>()
+        val definition = stateMachine<ChainState, ChainEvent<*>, ChainContext, ChainTransaction> {
+            transition(from = ChainState.A, on = ChainEvent.Go::class, to = ChainState.B)
+            transientState(ChainState.B, then = ChainState.C) { log.add("B"); "from-B" }
+            transientState(ChainState.C, then = ChainState.D) { log.add("C"); "from-C" }
+        }
+
+        val tx  = ChainTransaction(ChainState.A)
+        val ctx = ChainContext(tx)
+        StateMachine(definition).applyEvent(ChainEvent.Go, ctx)
+
+        assertEquals(ChainState.D, tx.currentState)
+        assertEquals(listOf("B", "C"), log)
+    }
+
+    @Test
+    fun `port is called with the final state after transient traversal`() {
+        val tx   = OrderTransaction(OrderState.SHIPPED)
+        val ctx  = OrderContext(tx, isPriority = true)
+        var updatedTx: OrderTransaction? = null
+        val port = object : MachineTransactionPort<OrderTransaction> {
+            override fun update(transaction: OrderTransaction) { updatedTx = transaction }
+        }
+        val machine = buildMachine(buildDefinition(), port)
+
+        machine.applyEvent(OrderEvent.Deliver, ctx)
+
+        assertNotNull(updatedTx)
+        assertEquals(OrderState.DELIVERED, updatedTx.currentState)
     }
 }
