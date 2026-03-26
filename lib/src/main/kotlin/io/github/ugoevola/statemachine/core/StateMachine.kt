@@ -23,7 +23,7 @@ class StateMachine<S, E : MachineEvent<*>, C : MachineContext<T>, T : MachineTra
         )
 
         val transaction = context.transaction!!
-        machineTransactionPort?.update(transaction)
+        machineTransactionPort?.save(transaction)
 
         return actionsResults
     }

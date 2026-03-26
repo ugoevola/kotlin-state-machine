@@ -307,7 +307,10 @@ class StateMachineTest {
         val ctx  = OrderContext(tx)
         var updatedTx: OrderTransaction? = null
         val port = object : MachineTransactionPort<OrderTransaction> {
-            override fun update(transaction: OrderTransaction) { updatedTx = transaction }
+            override fun save(transaction: OrderTransaction): OrderTransaction {
+                updatedTx = transaction
+                return updatedTx
+            }
         }
         val machine = buildMachine(buildDefinition(), port)
 
@@ -323,7 +326,10 @@ class StateMachineTest {
         val ctx  = OrderContext(tx)
         var portCalled = false
         val port = object : MachineTransactionPort<OrderTransaction> {
-            override fun update(transaction: OrderTransaction) { portCalled = true }
+            override fun save(transaction: OrderTransaction): OrderTransaction {
+                portCalled = true
+                return transaction
+            }
         }
         val machine = buildMachine(buildDefinition(), port)
 
@@ -474,7 +480,10 @@ class StateMachineTest {
         val ctx  = OrderContext(tx, isPriority = true)
         var updatedTx: OrderTransaction? = null
         val port = object : MachineTransactionPort<OrderTransaction> {
-            override fun update(transaction: OrderTransaction) { updatedTx = transaction }
+            override fun save(transaction: OrderTransaction): OrderTransaction {
+                updatedTx = transaction
+                return updatedTx
+            }
         }
         val machine = buildMachine(buildDefinition(), port)
 

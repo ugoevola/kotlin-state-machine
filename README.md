@@ -11,7 +11,7 @@ A lightweight, type-safe state machine library for Kotlin.
 
 ```kotlin
 dependencies {
-    implementation("io.github.ugoevola:kotlin-state-machine:1.1.0")
+    implementation("io.github.ugoevola:kotlin-state-machine:1.1.1")
 }
 ```
 
