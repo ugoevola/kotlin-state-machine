@@ -5,12 +5,12 @@ import io.github.ugoevola.statemachine.contract.MachineEvent
 import io.github.ugoevola.statemachine.contract.MachineTransaction
 import io.github.ugoevola.statemachine.contract.MachineTransactionPort
 
-class StateMachine<S, E : MachineEvent<*>, C : MachineContext<T>, T : MachineTransaction<S>>(
+open class StateMachine<S, E : MachineEvent<*>, C : MachineContext<T>, T : MachineTransaction<S>>(
     private val stateMachineDefinition: StateMachineDefinition<S, E, C, T>,
     private val machineTransactionPort: MachineTransactionPort<T>? = null
 ) {
 
-    fun <R> applyEvent(
+    open fun <R> applyEvent(
         event: MachineEvent<R>,
         context: C
     ): R? {
